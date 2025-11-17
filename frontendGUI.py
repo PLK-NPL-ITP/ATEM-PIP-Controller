@@ -467,21 +467,46 @@ class MouseInteractionMixin:
             else:
                 new_width = self.width()
             
+            # Calculate the scale factor that would result from this width
+            target_scale = new_width / self.base_width
+            
+            # Clamp to min/max scale ratios BEFORE applying resize
+            if target_scale < MIN_SCALE_RATIO:
+                new_width = int(self.base_width * MIN_SCALE_RATIO)
+                target_scale = MIN_SCALE_RATIO
+            elif target_scale > MAX_SCALE_RATIO:
+                new_width = int(self.base_width * MAX_SCALE_RATIO)
+                target_scale = MAX_SCALE_RATIO
+            
+            # Only proceed if scale actually changed (prevents jitter at limits)
+            if abs(target_scale - self.scale_factor) < 0.001:
+                return
+            
             # Enforce minimum width constraint
             new_width = max(MIN_WINDOW_WIDTH, new_width)
             
-            # Apply proportional resize
+            # Store old geometry for position adjustment
             old_geometry = self.geometry()
+            old_width = old_geometry.width()
+            old_height = old_geometry.height()
+            
+            # Apply proportional resize
             self.resize_window(new_width)
             
+            # Calculate actual size change after resize
+            width_change = self.width() - old_width
+            height_change = self.height() - old_height
+            
             # Adjust position when resizing from left edge (keep right edge fixed)
-            if self.resize_edge in ['left', 'topleft', 'bottomleft']:
-                new_x = old_geometry.right() - self.width()
+            if self.resize_edge in ['left', 'bottomleft', 'topleft']:
+                # Move window left by the amount width increased
+                new_x = old_geometry.x() - width_change
                 self.move(new_x, self.y())
             
             # Adjust position when resizing from top edge (keep bottom edge fixed)
             if self.resize_edge in ['top', 'topleft', 'topright']:
-                new_y = old_geometry.bottom() - self.height()
+                # Move window up by the amount height increased
+                new_y = old_geometry.y() - height_change
                 self.move(self.x(), new_y)
             
         elif self.dragging:
