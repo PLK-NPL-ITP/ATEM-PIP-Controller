@@ -10,13 +10,11 @@ from PyQt6 import QtCore, QtGui, QtWidgets
 # Window scaling parameters
 DEFAULT_WINDOW_WIDTH = 1600         # Initial window width in pixels
 MIN_WINDOW_WIDTH = 400              # Minimum allowed window width
-MIN_WINDOW_HEIGHT = 200             # Minimum allowed window height
-MAX_SCALE_RATIO = 3.0               # Maximum scaling ratio (3x original size)
-MIN_SCALE_RATIO = 0.2               # Minimum scaling ratio (0.2x original size)
+MAX_WINDOW_WIDTH = 2800             # Maximum allowed window width
 
 # Mouse interaction parameters (base values at original BKGD_IMG size w=2100)
 BASE_EDGE_MARGIN = 20               # Margin for edge detection at base scale
-BASE_CORNER_MARGIN = 50             # Margin for corner detection at base scale (x<35, y<35)
+BASE_CORNER_MARGIN = 50             # Margin for corner detection at base scale (x<50, y<50)
 ZOOM_STEP = 1.1                     # Zoom in/out multiplier (10% per step)
 
 # High DPI settings for Windows Qt6
@@ -234,6 +232,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.scale_factor = 1.0
         self.image_widgets = {}
         
+        # Calculate fixed window size based on MAX_WINDOW_WIDTH
+        self.max_scale = MAX_WINDOW_WIDTH / self.base_width
+        # Load background to get aspect ratio
+        temp_pixmap = QtGui.QPixmap(StaticResources.BKGD_IMG["default"])
+        self.aspect_ratio = temp_pixmap.height() / temp_pixmap.width()
+        self.fixed_window_width = MAX_WINDOW_WIDTH
+        self.fixed_window_height = int(MAX_WINDOW_WIDTH * self.aspect_ratio)
+        
         # Setup central widget with transparency
         self.central_widget = QtWidgets.QWidget()
         self.central_widget.setAttribute(QtCore.Qt.WidgetAttribute.WA_TranslucentBackground)
@@ -241,11 +247,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.central_widget.setAttribute(QtCore.Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         self.setCentralWidget(self.central_widget)
         
+        # Set fixed window size
+        self.setFixedSize(self.fixed_window_width, self.fixed_window_height)
+        
         # Create all UI elements
         self.init_ui()
         
-        # Set initial window size
-        self.resize_window(DEFAULT_WINDOW_WIDTH)
+        # Set initial content size
+        self.resize_content(DEFAULT_WINDOW_WIDTH)
     
     def init_ui(self):
         """Initialize all UI elements with proper mouse event handling"""
@@ -340,37 +349,52 @@ class MainWindow(QtWidgets.QMainWindow):
             self.pip_right_down_btn
         ]
 
-    def resize_window(self, new_width: int):
+    def resize_content(self, new_width: int):
         """
-        Resize window proportionally based on new width.
-        Enforces min/max scale ratios and updates all child widgets.
+        Resize content (BKGD_IMG and elements) based on new width.
+        Window size remains fixed. Only changes internal element scaling and positioning.
         """
-        # Calculate and clamp scale factor
+        # Clamp width to allowed range
+        new_width = max(MIN_WINDOW_WIDTH, min(MAX_WINDOW_WIDTH, new_width))
+        # Calculate scale factor
         self.scale_factor = new_width / self.base_width
-        self.scale_factor = max(MIN_SCALE_RATIO, min(MAX_SCALE_RATIO, self.scale_factor))
         
         # Update all image widgets with new scale
         for widget in self.image_widgets.values():
             widget.update_scale(self.scale_factor)
         
-        # Set window size based on scaled background dimensions
+        # Reposition all elements within the fixed window
+        self.update_positions()
+    
+    def get_bkgd_rect(self) -> QtCore.QRect:
+        """Get the current rectangle of the background image within the window"""
         if self.background.scaled_pixmap and not self.background.scaled_pixmap.isNull():
-            window_width = self.background.scaled_pixmap.width()
-            window_height = self.background.scaled_pixmap.height()
-            self.setFixedSize(window_width, window_height)
-            
-            # Reposition all elements
-            self.update_positions()
+            bkgd_width = self.background.scaled_pixmap.width()
+            bkgd_height = self.background.scaled_pixmap.height()
+            # Center the background in the fixed window
+            x = (self.fixed_window_width - bkgd_width) // 2
+            y = (self.fixed_window_height - bkgd_height) // 2
+            return QtCore.QRect(x, y, bkgd_width, bkgd_height)
+        return QtCore.QRect(0, 0, self.fixed_window_width, self.fixed_window_height)
     
     def update_positions(self):
-        """Update positions of all UI elements based on current scale"""
-        window_width = self.width()
-        window_height = self.height()
+        """Update positions of all UI elements based on current scale, centered in window"""
+        bkgd_rect = self.get_bkgd_rect()
+        bkgd_x = bkgd_rect.x()
+        bkgd_y = bkgd_rect.y()
+        bkgd_width = bkgd_rect.width()
+        bkgd_height = bkgd_rect.height()
         
-        # Calculate and apply new positions for all widgets
-        for widget in self.image_widgets.values():
-            x, y = widget.get_position(self.scale_factor, window_width, window_height)
-            widget.move(x, y)
+        # Position background centered in window
+        self.background.move(bkgd_x, bkgd_y)
+        
+        # Calculate and apply new positions for all other widgets relative to background
+        for name, widget in self.image_widgets.items():
+            if name == 'background':
+                continue
+            x, y = widget.get_position(self.scale_factor, bkgd_width, bkgd_height)
+            # Offset by background position
+            widget.move(x + bkgd_x, y + bkgd_y)
     
     def resizeEvent(self, event):
         """Handle window resize events"""
@@ -393,12 +417,12 @@ class MouseInteractionMixin:
         self.resizing = False
         self.resize_edge = None  # Current resize edge: 'left', 'right', 'top', 'bottom', 'topleft', etc.
         self.drag_position = QtCore.QPoint()
-        self.resize_start_geometry = None  # Window geometry at resize start
+        self.resize_start_width = None  # Content width at resize start
         self.button_press_position = None  # Track where button press started
         self.button_press_widget = None  # Track which button was pressed
         
-        # Calculate scale-aware margins (scales with window size)
-        # Base margins are defined at BKGD_IMG w=2100, corner at x<35, y<35
+        # Calculate scale-aware margins (scales with content size)
+        # Base margins are defined at BKGD_IMG w=2100, corner at x<50, y<50
         self.resize_margin = int(BASE_EDGE_MARGIN * self.scale_factor)
         self.corner_margin = int(BASE_CORNER_MARGIN * self.scale_factor)
         
@@ -417,6 +441,16 @@ class MouseInteractionMixin:
     def mousePressEvent(self, event: QtGui.QMouseEvent):
         """Handle mouse button press events"""
         if event.button() == QtCore.Qt.MouseButton.LeftButton:
+            # Check if mouse is within BKGD_IMG area
+            bkgd_rect = self.get_bkgd_rect()
+            if not bkgd_rect.contains(event.pos()):
+                # Outside background - ignore event (let it pass through)
+                event.ignore()
+                return
+            
+            # Convert to position relative to background
+            rel_pos = event.pos() - bkgd_rect.topLeft()
+            
             # Check if pressing on any interactive button
             for button in self.interactive_buttons:
                 if self.is_point_in_widget(event.pos(), button):
@@ -425,15 +459,15 @@ class MouseInteractionMixin:
                     self.button_press_widget = button
                     return
             
-            # Not on button - check if mouse is on resize edge/corner
+            # Not on button - check if mouse is on resize edge/corner (relative to BKGD)
             # Only allow resize if not over any button
             if not self.is_mouse_over_button(event.pos()):
-                edge = self.get_resize_edge(event.pos())
+                edge = self.get_resize_edge(rel_pos, bkgd_rect.width(), bkgd_rect.height())
                 if edge:
                     self.resizing = True
                     self.resize_edge = edge
                     self.drag_position = event.globalPosition().toPoint()
-                    self.resize_start_geometry = self.geometry()
+                    self.resize_start_width = int(self.scale_factor * self.base_width)
                 else:
                     # Start dragging mode if not on edge or button
                     self.dragging = True
@@ -441,73 +475,37 @@ class MouseInteractionMixin:
     
     def mouseMoveEvent(self, event: QtGui.QMouseEvent):
         """Handle mouse movement for resizing and dragging"""
+        bkgd_rect = self.get_bkgd_rect()
+        
+        # Check if mouse is within BKGD_IMG area for event handling
+        if not bkgd_rect.contains(event.pos()) and not self.resizing and not self.dragging:
+            # Outside background - ignore event (let it pass through)
+            event.ignore()
+            self.setCursor(QtCore.Qt.CursorShape.ArrowCursor)
+            return
+        
         if self.resizing and self.resize_edge:
-            # Calculate delta from resize start position
             delta = event.globalPosition().toPoint() - self.drag_position
             
-            # Calculate new width based on which edge is being dragged
+            # Calculate new width based on resize edge
             if self.resize_edge in ['right', 'bottomright', 'topright']:
-                # Right edge: increase width by delta
-                new_width = self.resize_start_geometry.width() + delta.x()
+                new_width = self.resize_start_width + delta.x()
             elif self.resize_edge in ['left', 'bottomleft', 'topleft']:
-                # Left edge: decrease width by delta (inverse)
-                new_width = self.resize_start_geometry.width() - delta.x()
-            elif self.resize_edge in ['bottom', 'top']:
-                # Vertical edges: calculate width from height change maintaining aspect ratio
-                if self.resize_edge == 'bottom':
-                    new_height = self.resize_start_geometry.height() + delta.y()
-                else:
-                    new_height = self.resize_start_geometry.height() - delta.y()
-                # Maintain aspect ratio using background image dimensions
-                if self.background.scaled_pixmap:
-                    aspect_ratio = self.background.scaled_pixmap.width() / self.background.scaled_pixmap.height()
-                    new_width = int(new_height * aspect_ratio)
-                else:
-                    new_width = self.width()
-            else:
-                new_width = self.width()
+                new_width = self.resize_start_width - delta.x()
+            else:  # top or bottom - maintain aspect ratio
+                new_height = int(self.resize_start_width * self.aspect_ratio) + (delta.y() if self.resize_edge == 'bottom' else -delta.y())
+                new_width = int(new_height / self.aspect_ratio)
             
-            # Calculate the scale factor that would result from this width
-            target_scale = new_width / self.base_width
+            # Clamp width to allowed range
+            new_width = max(MIN_WINDOW_WIDTH, min(MAX_WINDOW_WIDTH, new_width))
             
-            # Clamp to min/max scale ratios BEFORE applying resize
-            if target_scale < MIN_SCALE_RATIO:
-                new_width = int(self.base_width * MIN_SCALE_RATIO)
-                target_scale = MIN_SCALE_RATIO
-            elif target_scale > MAX_SCALE_RATIO:
-                new_width = int(self.base_width * MAX_SCALE_RATIO)
-                target_scale = MAX_SCALE_RATIO
-            
-            # Only proceed if scale actually changed (prevents jitter at limits)
-            if abs(target_scale - self.scale_factor) < 0.001:
+            # Check for meaningful change
+            current_width = int(self.scale_factor * self.base_width)
+            if abs(new_width - current_width) < 2:
                 return
             
-            # Enforce minimum width constraint
-            new_width = max(MIN_WINDOW_WIDTH, new_width)
-            
-            # Store old geometry for position adjustment
-            old_geometry = self.geometry()
-            old_width = old_geometry.width()
-            old_height = old_geometry.height()
-            
-            # Apply proportional resize
-            self.resize_window(new_width)
-            
-            # Calculate actual size change after resize
-            width_change = self.width() - old_width
-            height_change = self.height() - old_height
-            
-            # Adjust position when resizing from left edge (keep right edge fixed)
-            if self.resize_edge in ['left', 'bottomleft', 'topleft']:
-                # Move window left by the amount width increased
-                new_x = old_geometry.x() - width_change
-                self.move(new_x, self.y())
-            
-            # Adjust position when resizing from top edge (keep bottom edge fixed)
-            if self.resize_edge in ['top', 'topleft', 'topright']:
-                # Move window up by the amount height increased
-                new_y = old_geometry.y() - height_change
-                self.move(self.x(), new_y)
+            # Apply content resize (window position and size stay fixed)
+            self.resize_content(new_width)
             
         elif self.dragging:
             # Cancel dragging if mouse moves over a button
@@ -517,8 +515,9 @@ class MouseInteractionMixin:
                 # Move window while dragging
                 self.move(event.globalPosition().toPoint() - self.drag_position)
         else:
-            # Update cursor based on mouse position
-            self.update_cursor(event.pos())
+            # Update cursor based on mouse position relative to background
+            rel_pos = event.pos() - bkgd_rect.topLeft()
+            self.update_cursor(rel_pos, bkgd_rect.width(), bkgd_rect.height())
     
     def mouseReleaseEvent(self, event: QtGui.QMouseEvent):
         """Handle mouse button release and button click triggers"""
@@ -544,17 +543,15 @@ class MouseInteractionMixin:
             self.dragging = False
             self.resizing = False
             self.resize_edge = None
-            self.resize_start_geometry = None
+            self.resize_start_width = None
     
-    def get_resize_edge(self, pos: QtCore.QPoint) -> Optional[str]:
+    def get_resize_edge(self, pos: QtCore.QPoint, bkgd_width: int, bkgd_height: int) -> Optional[str]:
         """
-        Detect which edge or corner the mouse is on.
-        Uses scale-aware margins for consistent detection at any window size.
+        Detect which edge or corner the mouse is on relative to BKGD_IMG.
+        Uses scale-aware margins for consistent detection at any scale.
         """
         x = pos.x()
         y = pos.y()
-        w = self.width()
-        h = self.height()
         
         # Update margins based on current scale
         self.resize_margin = int(BASE_EDGE_MARGIN * self.scale_factor)
@@ -562,18 +559,18 @@ class MouseInteractionMixin:
         
         # Check if near each edge
         on_left = x <= self.resize_margin
-        on_right = x >= w - self.resize_margin
+        on_right = x >= bkgd_width - self.resize_margin
         on_top = y <= self.resize_margin
-        on_bottom = y >= h - self.resize_margin
+        on_bottom = y >= bkgd_height - self.resize_margin
         
         # Check corners first (higher priority than edges)
         if x <= self.corner_margin and y <= self.corner_margin:
             return 'topleft'
-        elif x >= w - self.corner_margin and y <= self.corner_margin:
+        elif x >= bkgd_width - self.corner_margin and y <= self.corner_margin:
             return 'topright'
-        elif x <= self.corner_margin and y >= h - self.corner_margin:
+        elif x <= self.corner_margin and y >= bkgd_height - self.corner_margin:
             return 'bottomleft'
-        elif x >= w - self.corner_margin and y >= h - self.corner_margin:
+        elif x >= bkgd_width - self.corner_margin and y >= bkgd_height - self.corner_margin:
             return 'bottomright'
         
         # Check edges
@@ -588,18 +585,22 @@ class MouseInteractionMixin:
         
         return None
     
-    def update_cursor(self, pos: QtCore.QPoint):
+    def update_cursor(self, rel_pos: QtCore.QPoint, bkgd_width: int, bkgd_height: int):
         """
-        Update cursor icon based on mouse position.
+        Update cursor icon based on mouse position relative to BKGD_IMG.
         Shows appropriate resize cursor or pointer cursor for buttons.
         """
+        # Convert relative position back to absolute for button checking
+        bkgd_rect = self.get_bkgd_rect()
+        abs_pos = rel_pos + bkgd_rect.topLeft()
+        
         # Check if hovering over any interactive button
-        if self.is_mouse_over_button(pos):
+        if self.is_mouse_over_button(abs_pos):
             self.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
             return
         
         # Otherwise show resize cursor based on edge
-        edge = self.get_resize_edge(pos)
+        edge = self.get_resize_edge(rel_pos, bkgd_width, bkgd_height)
         
         if edge in ['left', 'right']:
             self.setCursor(QtCore.Qt.CursorShape.SizeHorCursor)
@@ -651,19 +652,21 @@ class KeyBindingMixin:
         self.reset_size_shortcut.activated.connect(self.reset_size)
     
     def zoom_in(self):
-        """Increase window size by ZOOM_STEP multiplier"""
-        new_width = int(self.width() * ZOOM_STEP)
-        self.resize_window(new_width)
+        """Increase content size by ZOOM_STEP multiplier"""
+        current_width = int(self.scale_factor * self.base_width)
+        new_width = int(current_width * ZOOM_STEP)
+        self.resize_content(new_width)
     
     def zoom_out(self):
-        """Decrease window size by ZOOM_STEP divisor"""
-        new_width = int(self.width() / ZOOM_STEP)
+        """Decrease content size by ZOOM_STEP divisor"""
+        current_width = int(self.scale_factor * self.base_width)
+        new_width = int(current_width / ZOOM_STEP)
         new_width = max(MIN_WINDOW_WIDTH, new_width)
-        self.resize_window(new_width)
+        self.resize_content(new_width)
     
     def reset_size(self):
-        """Reset window to default size"""
-        self.resize_window(DEFAULT_WINDOW_WIDTH)
+        """Reset content to default size"""
+        self.resize_content(DEFAULT_WINDOW_WIDTH)
 
 
 # ================================================================================
