@@ -1,10 +1,10 @@
 import sys
 import os
-from typing import Optional, TypedDict, List, Dict
+from typing import Optional, TypedDict, Dict, Callable
 
+import keyboard
+import pyautogui
 from PyQt6 import QtCore, QtGui, QtWidgets
-import time
-import threading
 
 # ================================================================================
 # Global Configuration Variables
@@ -18,6 +18,15 @@ MAX_WINDOW_WIDTH: int = 2800             # Maximum allowed window width
 # Mouse interaction parameters (base values at original BKGD_IMG size w=2100)
 BASE_EDGE_MARGIN: int = 20               # Margin for edge detection at base scale
 BASE_CORNER_MARGIN: int = 50             # Margin for corner detection at base scale (x<50, y<50)
+DOUBLE_CLICK_INTERVAL: int = 400         # Max interval (ms) between clicks to register double-click
+
+# Keyboard Shortcut parameters
+KEYBOARD_SHORTCUTS_ENABLED: bool = True          # Enable or disable keyboard shortcuts globally
+# Scope options:
+#   "global suppress" -> highest priority, prevents other apps from receiving the hotkey
+#   "global"          -> system-wide, but lets other apps respond as well
+#   "application"     -> shortcut works only when this window is focused
+KEYBOARD_SHORTCUTS_RANGE: str = "global suppress"
 
 # High DPI settings for Windows Qt6
 # Reference: https://zhuanlan.zhihu.com/p/9871635469
@@ -49,9 +58,11 @@ class StaticResources:
     BKGD_IMG: ResourceSpec = {"name": "BKGD_IMG", "default": "./resources/BKGD.png", 
         "x": 0, "y": 0, "w": 2100}
     EXIT_BTN: ResourceSpec = {"name": "EXIT_BTN", "default": "./resources/EXIT.png", 
-        "x": -117, "y": 78, "w": 39}
+        "x": -117, "y": 78, "w": 39,
+        "keyboardBinds": QtGui.QKeySequence("ctrl+q")}
     MIN_BTN: ResourceSpec = {"name": "MIN_BTN", "default": "./resources/Minimize.png", 
-        "x": -172, "y": 78, "w": 39}
+        "x": -172, "y": 78, "w": 39, 
+        "keyboardBinds": QtGui.QKeySequence("ctrl+m")}
     
     PIP_SOURCE1_BTN: ResourceSpec = {"name": "PIP_SOURCE1_BTN", "default": "./resources/PIP Source1 W.png",
         'WHITE': "./resources/PIP Source1 W.png",
@@ -236,8 +247,41 @@ class StaticResources:
         'RED': "./resources/Trans FTB R.png",
         'x': 1750, 'y': 788, 'w': 233}
 
+class ATEMSoftwareProperties:
+    """Holds properties for connecting to ATEM Software Control."""
+    DUR: int = None
+    PIP_Source: int = None
+    KEY_1: bool = None
+    ON_AIR: bool = None
+
 # ================================================================================
-# PART I: UI Rendering
+# Keyboard Shortcuts
+# ================================================================================
+
+class ShortcutManager:
+    """Manage keyboard shortcuts for different scope settings."""
+
+    def register(self, key_sequence: QtGui.QKeySequence, callback: Callable[[], None]):
+        scope = (KEYBOARD_SHORTCUTS_RANGE or "application").strip().lower()
+        if scope not in {"global suppress", "global", "application"}: scope = "application"
+
+        if scope == "application":
+            QtGui.QShortcut(key_sequence, self, activated=callback)
+            return
+        suppress = scope == "global suppress"
+        if not self._register_global_shortcut(key_sequence, callback, suppress):
+            QtGui.QShortcut(key_sequence, self, activated=callback)
+
+    def _register_global_shortcut(self, key_sequence: QtGui.QKeySequence, callback: Callable[[], None], suppress: bool) -> bool:
+        combo = key_sequence.toString().lower()
+
+        def trigger(): QtCore.QTimer.singleShot(0, callback)
+        try: keyboard.add_hotkey(combo, trigger, suppress=suppress)
+        except: return False
+        finally: return True
+
+# ================================================================================
+# UI Rendering
 # ================================================================================
 class ImageWidget(QtWidgets.QWidget):
     """
@@ -393,18 +437,22 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Create all UI elements
         self.init_ui()
-        
-        # Set initial content size
         self.resize_content(DEFAULT_WINDOW_WIDTH)
+        self.showNormal()
     
     def init_ui(self):
         """Initialize all UI elements with proper mouse event handling"""
         self.image_widgets.clear()
+        if KEYBOARD_SHORTCUTS_ENABLED:
+            keyboard.unhook_all()
         for name, spec in self.resource_specs.items():
             widget = ImageWidget(spec, self.base_width, self.central_widget)
-            widget.setMouseTracking(True)
-            widget.setAttribute(QtCore.Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
             self.image_widgets[name] = widget
+            self.setMouseTracking(True)
+            self.setAttribute(QtCore.Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)  
+            keyboardBinds = spec.get("keyboardBinds")
+            if keyboardBinds and KEYBOARD_SHORTCUTS_ENABLED:
+                self.register(keyboardBinds, self.attributeFuncs[name])
 
     def _collect_resource_specs(self) -> dict[str, ResourceSpec]:
         """Gather all ResourceSpec definitions declared on StaticResources."""
@@ -454,7 +502,7 @@ class MainWindow(QtWidgets.QMainWindow):
         return QtCore.QRect(x, y, bkgd_width, bkgd_height)
 
 # ================================================================================
-# PART II: Mouse Interaction Handling
+# Mouse Interaction Handling
 # ================================================================================
 class MouseInteractionMixin:
     """
@@ -545,12 +593,7 @@ class MouseInteractionMixin:
         if event.button() == QtCore.Qt.MouseButton.LeftButton:
             if self.button_press_widget and self.is_point_in_widget(event.pos(), self.button_press_widget):
                 widget_name = self.button_press_widget.resource_spec["name"]
-                if widget_name == StaticResources.EXIT_BTN["name"]:
-                    QtWidgets.QApplication.quit()
-                elif widget_name == StaticResources.MIN_BTN["name"]:
-                    self.showMinimized()
-                else:
-                    print(f"Button clicked: {widget_name}")
+                self.attributeFuncs[widget_name]() if widget_name in self.attributeFuncs else None
             if self.dragging:
                 self.setCursor(QtCore.Qt.CursorShape.ArrowCursor)
 
@@ -601,23 +644,40 @@ class MouseInteractionMixin:
         self.setCursor(cursor_map.get(edge, QtCore.Qt.CursorShape.ArrowCursor))
 
 # ================================================================================
-# PART III: Keyboard Shortcuts
+# Signal Handling for ATEM PIP Controller
 # ================================================================================
 
-# PLAN TO DEVELOP IN FUTURE UPDATES
+class SignalsHandler:
+    def __init__(self):
+        self.attributeFuncs: Dict[str, Callable[[], None]] = {
+            "EXIT_BTN": self.exit_application,
+            "MIN_BTN": self.minimize_application,
+        }
+
+    def exit_application(self):
+        """Handle application exit signal."""
+        keyboard.unhook_all()
+        QtWidgets.QApplication.quit()
+    
+    def minimize_application(self):
+        """Handle application minimize signal."""
+        if self.isMinimized(): self.showNormal()
+        else: self.showMinimized()
 
 # ================================================================================
-# PART IV: Main Application Class
+# Main Application Class
 # ================================================================================
-class ATEMPIPController(MainWindow, MouseInteractionMixin):
+class ATEMPIPController(ShortcutManager, MainWindow, SignalsHandler, MouseInteractionMixin):
     """
     Main application controller integrating all functionality.
     Combines window rendering, mouse interaction, and keyboard shortcuts.
     """
     
     def __init__(self):
-        super().__init__()
-        self.setup_mouse_interaction()
+        # Explicitly initialize all mixin/base classes
+        MainWindow.__init__(self)
+        SignalsHandler.__init__(self)
+        MouseInteractionMixin.setup_mouse_interaction(self)
 
 # ================================================================================
 # Application Entry Point
