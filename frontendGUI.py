@@ -1,8 +1,10 @@
 import sys
 import os
-from typing import Optional, TypedDict, List
+from typing import Optional, TypedDict, List, Dict
 
 from PyQt6 import QtCore, QtGui, QtWidgets
+import time
+import threading
 
 # ================================================================================
 # Global Configuration Variables
@@ -11,6 +13,7 @@ from PyQt6 import QtCore, QtGui, QtWidgets
 DEFAULT_WINDOW_WIDTH: int = 1600         # Initial window width in pixels
 MIN_WINDOW_WIDTH: int = 400              # Minimum allowed window width
 MAX_WINDOW_WIDTH: int = 2800             # Maximum allowed window width
+### !Dynamic Variables Modification in MainWindow __init__
 
 # Mouse interaction parameters (base values at original BKGD_IMG size w=2100)
 BASE_EDGE_MARGIN: int = 20               # Margin for edge detection at base scale
@@ -39,13 +42,16 @@ class ResourceSpec(TypedDict):
     x: int                   # X position (negative = from right edge)
     y: int                   # Y position (negative = from bottom edge)
     w: int                   # Width at base scale
-    keyboardBinds: Optional[List[str]] # Optional keyboard bindings
+    keyboardBinds: Optional[QtGui.QKeySequence] # Optional keyboard bindings
 
 class StaticResources:
     """Resource paths and specifications for all UI elements"""
-    BKGD_IMG: ResourceSpec = {"name": "BKGD_IMG", "default": "./resources/BKGD.png", "x": 0, "y": 0, "w": 2100}
-    EXIT_BTN: ResourceSpec = {"name": "EXIT_BTN", "default": "./resources/EXIT.png", "x": -117, "y": 78, "w": 39}
-    MIN_BTN: ResourceSpec = {"name": "MIN_BTN", "default": "./resources/Minimize.png", "x": -172, "y": 78, "w": 39}
+    BKGD_IMG: ResourceSpec = {"name": "BKGD_IMG", "default": "./resources/BKGD.png", 
+        "x": 0, "y": 0, "w": 2100}
+    EXIT_BTN: ResourceSpec = {"name": "EXIT_BTN", "default": "./resources/EXIT.png", 
+        "x": -117, "y": 78, "w": 39}
+    MIN_BTN: ResourceSpec = {"name": "MIN_BTN", "default": "./resources/Minimize.png", 
+        "x": -172, "y": 78, "w": 39}
     
     PIP_SOURCE1_BTN: ResourceSpec = {"name": "PIP_SOURCE1_BTN", "default": "./resources/PIP Source1 W.png",
         'WHITE': "./resources/PIP Source1 W.png",
@@ -243,27 +249,44 @@ class ImageWidget(QtWidgets.QWidget):
         super().__init__(parent)
         self.resource_spec = resource_spec
         self.base_width = base_width
-        self.original_pixmap = None
+        default_path = resource_spec["default"]
+        self.original_pixmap = QtGui.QPixmap(default_path)
+        if self.original_pixmap.isNull():
+            raise RuntimeError(f"Warning: Failed to load image {default_path} for widget {resource_spec['name']}")
         self.scaled_pixmap = None
         self.current_scale = 1.0
+        self.pixmap_cache: dict[Optional[str], QtGui.QPixmap] = {None: self.original_pixmap}
         
-        # Load the image from resource specification
-        self.load_image(resource_spec["default"])
+        self.current_state: Optional[str] = "default"
+        self.variant_states: tuple[str, ...] = tuple(
+            state for state in ("WHITE", "YELLOW", "GREEN", "DISABLED", "RED")
+            if resource_spec.get(state)
+        )
         
         # Enable transparency for rounded corners and alpha channel
         self.setAttribute(QtCore.Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setAttribute(QtCore.Qt.WidgetAttribute.WA_OpaquePaintEvent, False)
-        # Initially don't pass through mouse events (will be configured per widget)
-        self.setAttribute(QtCore.Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
     
-    def load_image(self, image_path: str):
-        """
-        Load image directly as QPixmap from file path.
-        QPixmap automatically handles transparency and format conversion.
-        """
-        self.original_pixmap = QtGui.QPixmap(image_path)
-        if self.original_pixmap.isNull():
-            print(f"Warning: Failed to load image: {image_path}")
+    def set_state(self, state: str) -> bool:
+        """Switch to a specific state if that artwork exists."""
+        if state not in self.variant_states:
+            return False
+        if self.current_state == state:
+            return True
+        pixmap = self.pixmap_cache.get(state)
+        if pixmap is None:
+            asset_path = self.resource_spec.get(state)
+            if not asset_path:
+                return False
+            pixmap = QtGui.QPixmap(asset_path)
+            if pixmap.isNull():
+                print(f"Warning: Failed to load image: {asset_path}")
+                return False
+            self.pixmap_cache[state] = pixmap
+        self.original_pixmap = pixmap
+        self.current_state = state
+        self.update_scale(self.current_scale)
+        return True
     
     def update_scale(self, scale_factor: float):
         """
@@ -334,18 +357,23 @@ class MainWindow(QtWidgets.QMainWindow):
         # Enable transparency for rounded corners
         self.setAttribute(QtCore.Qt.WidgetAttribute.WA_TranslucentBackground)
         
+        # modify module-level configuration based on screen size
+        global DEFAULT_WINDOW_WIDTH, MIN_WINDOW_WIDTH, MAX_WINDOW_WIDTH
+        screen_geometry = QtWidgets.QApplication.primaryScreen().geometry()
+        DEFAULT_WINDOW_WIDTH = int(max(DEFAULT_WINDOW_WIDTH, int(screen_geometry.width() * 0.5)))
+        MIN_WINDOW_WIDTH = int(max(MIN_WINDOW_WIDTH, int(screen_geometry.width() * 0.25)))
+        MAX_WINDOW_WIDTH = int(min(MAX_WINDOW_WIDTH, screen_geometry.width()))
+
         # Initialize scaling variables
         self.base_width = StaticResources.BKGD_IMG["w"]
         self.scale_factor = 1.0
-        self.image_widgets = {}
+        self.image_widgets: Dict[str, ImageWidget] = {}
         self.resource_specs = self._collect_resource_specs()
         self.background_name = StaticResources.BKGD_IMG["name"]
-        
-        # Calculate fixed window size based on MAX_WINDOW_WIDTH
-        self.max_scale = MAX_WINDOW_WIDTH / self.base_width
+
         # Load background to get aspect ratio
-        temp_pixmap = QtGui.QPixmap(StaticResources.BKGD_IMG["default"])
-        self.aspect_ratio = temp_pixmap.height() / temp_pixmap.width()
+        __temp_pixmap = QtGui.QPixmap(StaticResources.BKGD_IMG["default"])
+        self.aspect_ratio = __temp_pixmap.height() / __temp_pixmap.width()
         self.fixed_window_width = MAX_WINDOW_WIDTH
         self.fixed_window_height = int(MAX_WINDOW_WIDTH * self.aspect_ratio)
         
@@ -358,7 +386,11 @@ class MainWindow(QtWidgets.QMainWindow):
         
         # Set fixed window size
         self.setFixedSize(self.fixed_window_width, self.fixed_window_height)
-        
+        # Set fixed window place center of screen
+        x = (screen_geometry.width() - self.fixed_window_width) // 2
+        y = (screen_geometry.height() - self.fixed_window_height) // 2
+        self.move(x, y)
+
         # Create all UI elements
         self.init_ui()
         
